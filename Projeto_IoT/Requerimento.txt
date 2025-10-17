@@ -1,0 +1,33 @@
+#################################################################
+# REQUISITOS DE DEPENDÊNCIAS DO PROJETO ESP32 (ARDUINO IDE)
+#################################################################
+
+## 1. CORE DA PLACA (ESP32)
+
+# 1.1. URL Adicional para o Gerenciador de Placas:
+# Adicione esta URL em Arquivo > Preferências:
+# https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+# 1.2. Placa a ser Selecionada:
+# Instale o core "esp32 by Espressif Systems" no Gerenciador de Placas e selecione "ESP32 Dev Module".
+
+
+## 2. BIBLIOTECAS (GERENCIADOR DE BIBLIOTECAS)
+
+# 2.1. WiFiManager
+# Funcao: Configuração de Wi-Fi via portal.
+# Autor: tzapu
+# Versão Crítica: Tente a mais recente. Se falhar na compilação, use a **0.16.0**.
+
+# 2.2. BH1750
+# Funcao: Sensor de Luminosidade.
+# Autor: Christopher Baker ou Adafruit
+# Versão: Mais recente.
+
+# 2.3. HTTPClient
+# Status: Já inclusa ao instalar o Core ESP32.
+
+# 2.4. Bibliotecas Nativas (Já inclusas no Core)
+# - <WiFi.h>
+# - <Wire.h>
+# - <time.h>
