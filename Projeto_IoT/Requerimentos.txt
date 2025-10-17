@@ -1,0 +1,48 @@
+#################################################################
+# REQUISITOS DE DEPENDÊNCIAS DO PROJETO ESP32 (ARDUINO IDE)
+#################################################################
+
+## 1. DRIVERS DA PLACA (USB-SERIAL)
+
+# O driver é necessário para que o sistema operacional (Windows/Mac)
+# reconheça o ESP32 e crie uma porta COM/Serial para upload do código.
+# Você só precisa instalar um dos dois, dependendo do chip na sua placa.
+
+# 1.1. CH340 / CH341 / CH9102 (Comum em placas genéricas)
+#   - Se a porta COM não aparecer, tente instalar este driver.
+#   - Geralmente disponível no site do fabricante WCH.
+
+# 1.2. CP210x (Comum em placas DevKit)
+#   - Se o CH340 não funcionar, instale este driver (Silicon Labs).
+#   - Disponível no site oficial da Silicon Labs.
+
+
+## 2. CORE DA PLACA (ESP32)
+
+# 2.1. URL Adicional para o Gerenciador de Placas:
+# Adicione esta URL em Arquivo > Preferências:
+# https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+# 2.2. Placa a ser Selecionada:
+# Instale o core "esp32 by Espressif Systems" no Gerenciador de Placas e selecione "ESP32 Dev Module".
+
+
+## 3. BIBLIOTECAS (GERENCIADOR DE BIBLIOTECAS)
+
+# 3.1. WiFiManager
+# Funcao: Configuração de Wi-Fi via portal.
+# Autor: tzapu
+# Versão Crítica: Tente a mais recente. Se falhar na compilação, use a **0.16.0**.
+
+# 3.2. BH1750
+# Funcao: Sensor de Luminosidade.
+# Autor: Christopher Baker ou Adafruit
+# Versão: Mais recente.
+
+# 3.3. HTTPClient
+# Status: Já inclusa ao instalar o Core ESP32.
+
+# 3.4. Bibliotecas Nativas (Já inclusas no Core)
+# - <WiFi.h>
+# - <Wire.h>
+# - <time.h>
