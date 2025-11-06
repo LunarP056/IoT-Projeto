@@ -20,7 +20,7 @@
 // ====================================================================
 
 // URL do Google Apps Script para receber os dados via POST.
-const char* SHEETS_URL = "https://script.google.com/macros/s/AKfycbwX7wyOwjaBb6jI69mneSN4QnMQWn2Ix1to62z9skojNqEPoPgCXsgVVnE8Y-0PvbDN/exec"; 
+const char* SHEETS_URL = "https://script.google.com/macros/s/AKfycbyd12345ABCDEFabcdef0123456789/exec"; 
 
 // ID único para identificar este dispositivo na planilha.
 const char* DEVICE_ID = "PC_USER_01"; 
@@ -29,6 +29,29 @@ const char* DEVICE_ID = "PC_USER_01";
 const char* ntpServer = "pool.ntp.org";      // Servidor NTP global.
 const long gmtOffset_sec = -10800;           // Offset de GMT em segundos (Ex: -3 horas para Brasília: -3 * 3600 = -10800).
 const int daylightOffset_sec = 0;            // Ajuste para Horário de Verão (0 se não usado).
+
+// ====================================================================
+// VARIÁVEIS DE CÁLCULO E TEMPORIZAÇÃO (MILLIS)
+// ====================================================================
+
+// Intervalo entre cada leitura de sensor (10 segundos = 10000 ms).
+const long LEITURA_INTERVALO_MS = 10000; 
+unsigned long ultimoTempoLeitura = 0; // Armazena o último momento que a leitura foi feita.
+
+// --- Configurações da Média Móvel ---
+// Baseado no intervalo de 10s, definimos 4 amostras.
+// O envio ocorrerá a cada 4 amostras (40 segundos).
+const int NUM_AMOSTRAS = 4; 
+int indiceAmostra = 0; // Índice atual da amostra no array (onde o próximo dado será armazenado).
+int amostrasColetadas = 0; // Contador de quantas amostras válidas foram coletadas (máximo NUM_AMOSTRAS)
+
+// Arrays para armazenar as últimas N amostras para o cálculo da média.
+float distarray[NUM_AMOSTRAS]; // Array para distância
+float lux_arr[NUM_AMOSTRAS]; // Array para luminosidade
+
+// --- Limiares de Alerta ---
+const float LIMIAR_DISTANCIA_CM = 50.0; // Distância (muito próximo) 
+const float LIMIAR_LUX = 30.0;         // Luminosidade (muito escuro)
 
 // ====================================================================
 // VARIÁVEIS DE HARDWARE E ESTADO
@@ -50,8 +73,6 @@ WiFiClient espClient;
 // ====================================================================
 // FUNÇÃO: setup_wifi_manager()
 // ====================================================================
-// Inicia o WiFiManager. Se não estiver configurado, cria um hotspot
-// para que o usuário possa configurar o Wi-Fi.
 
 void setup_wifi_manager() {
     WiFiManager wm; // Cria uma instância do WiFiManager.
@@ -77,7 +98,6 @@ void setup_wifi_manager() {
 // ====================================================================
 // FUNÇÃO: get_current_timestamp()
 // ====================================================================
-// Retorna o timestamp Unix (segundos desde 1970) após a sincronização NTP.
 
 long get_current_timestamp() {
     time_t now;      // Variável para o timestamp Unix.
@@ -95,7 +115,6 @@ long get_current_timestamp() {
 // ====================================================================
 // FUNÇÃO: proximidade()
 // ====================================================================
-// Realiza a leitura do sensor ultrassônico HC-SR04 e retorna a distância em cm.
 
 float proximidade() {
     // 1. Limpa o pino TRIGGER (garante LOW por 2µs).
@@ -120,7 +139,6 @@ float proximidade() {
 // ====================================================================
 // FUNÇÃO: luminosidade()
 // ====================================================================
-// Realiza a leitura do sensor BH1750 e retorna o nível de luz em Lux.
 
 float luminosidade() {
     // Inicializa o sensor APENAS na primeira vez que a função é chamada.
@@ -143,9 +161,8 @@ float luminosidade() {
 // ====================================================================
 // FUNÇÃO: enviar_dados_sheets()
 // ====================================================================
-// Monta o JSON com os dados e envia via HTTP POST para o Apps Script.
 
-void enviar_dados_sheets(float distance, float lux) {
+void enviar_dados_sheets(float distance_avg, float lux_avg, long timestamp, bool alertaProx, bool alertaLux) {
     // Verifica a conexão Wi-Fi antes de tentar o envio.
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("Wi-Fi não conectado. Pulando envio.");
@@ -156,44 +173,60 @@ void enviar_dados_sheets(float distance, float lux) {
     http.begin(SHEETS_URL); // Inicia a conexão HTTP com o URL do Google Sheets.
     http.addHeader("Content-Type", "application/json"); // Define o cabeçalho para JSON.
 
-    char payload[256]; // Buffer para armazenar a string JSON.
+    char payload[350]; 
     
     char dist_str[10];
     char lux_str[10];
-    // Converte floats para strings com 2 casas decimais.
-    dtostrf(distance, 4, 2, dist_str); 
-    dtostrf(lux, 4, 2, lux_str);
-
-    // Monta a string JSON no formato {"id":"PC_USER_01","distance":XX.XX,"lux":YY.YY}
-    snprintf(payload, sizeof(payload), 
-             "{\"id\":\"%s\",\"distance\":%s,\"lux\":%s}", 
-             DEVICE_ID, dist_str, lux_str);
+    char ts_str[15]; 
     
-    Serial.print("Enviando JSON: ");
+    // Converte floats para strings com 2 casas decimais.
+    dtostrf(distance_avg, 4, 2, dist_str); 
+    dtostrf(lux_avg, 4, 2, lux_str);
+    
+    // Converte o long timestamp para string.
+    snprintf(ts_str, sizeof(ts_str), "%ld", timestamp); 
+
+    // --- Montagem do JSON ---
+    snprintf(payload, sizeof(payload), 
+             "{\"id\":\"%s\",\"distance\":%s,\"lux\":%s,\"timestamp\":%s,\"alertaProx\":%s,\"alertaLux\":%s}", 
+             DEVICE_ID, 
+             dist_str, 
+             lux_str,
+             ts_str,
+             alertaProx ? "true" : "false", 
+             alertaLux ? "true" : "false"); 
+    
+    Serial.print("Enviando JSON de Alerta: ");
     Serial.println(payload);
 
-    // Realiza o POST e armazena o código de resposta (ex: 200 para sucesso).
     int httpResponseCode = http.POST(payload);
 
     if (httpResponseCode > 0) {
-        Serial.print("Dados enviados com sucesso. Código HTTP: ");
-        Serial.println(httpResponseCode);
-        String response = http.getString();
-        Serial.print("Resposta do Servidor: ");
-        Serial.println(response); // Imprime a resposta do Apps Script (geralmente "Success").
+        // Código de resposta HTTP positivo, o ESP32 enviou o pacote.
+        Serial.printf("Dados enviados. Código HTTP: %d\n", httpResponseCode);
     } else {
-        Serial.print("Falha ao enviar dados. Erro HTTP: ");
-        Serial.println(httpResponseCode);
+        // Código de resposta HTTP negativo (ex: -11 é falha na conexão, 404 é URL não encontrada).
+        Serial.printf("Falha ao enviar dados. Erro HTTP: %d (Verifique a SHEETS_URL e o status do Wi-Fi)\n", httpResponseCode);
     }
     
-    http.end(); // Fecha a conexão HTTP para liberar recursos.
+    http.end(); // Fecha a conexão HTTP.
 }
 
+// ====================================================================
+// Calcula a média de um array de floats.
 
+float calcular_media(float arr[], int tamanho) {
+    float soma = 0.0;
+    
+    for (int i = 0; i < tamanho; i++) {
+        soma += arr[i];
+    }
+    // Garante que não dividimos por zero e retorna a média.
+    return (tamanho > 0) ? (soma / tamanho) : 0.0;
+}
 // ====================================================================
 // FUNÇÃO: setup()
 // ====================================================================
-// Executada uma única vez ao iniciar a placa.
 
 void setup() {
     Serial.begin(9600); // Inicia a comunicação serial para debug (Monitor Serial).
@@ -214,24 +247,77 @@ void setup() {
 // ====================================================================
 // FUNÇÃO: loop()
 // ====================================================================
-// Executada repetidamente após a função setup().
 
 void loop() {
-    // 1. Coleta dos dados dos sensores
-    float distance = proximidade();
-    float lux = luminosidade();
-    long timestamp = get_current_timestamp(); // Pega o timestamp atual (não usado no payload, mas útil para debug).
+    unsigned long tempoAtual = millis();
 
-    // 2. Verifica se a leitura de luz é válida
-    if (lux < 0) {
-        Serial.println("AVISO: Leitura de Lux inválida. Pulando envio.");
-        delay(30000); // Espera o tempo normal de loop antes de tentar novamente.
-        return; 
+    // --- 1. Lógica de Coleta de Dados (a cada 10 segundos) ---
+    if (tempoAtual - ultimoTempoLeitura >= LEITURA_INTERVALO_MS) {
+        ultimoTempoLeitura = tempoAtual;
+
+        // ** Ação 1: Coleta dos dados dos sensores **
+        float distancia = proximidade();
+        float lux = luminosidade(); 
+        
+        // ** Ação 2: Armazenamento circular dos dados **
+        
+        // Armazena a leitura atual no índice atual dos arrays.
+        distarray[indiceAmostra] = distancia; 
+        lux_arr[indiceAmostra] = lux;
+        
+        Serial.printf("\n[COLETA #%d] Dist: %.2f cm | Lux: %.2f lx\n", indiceAmostra, distancia, lux);
+
+        // ** Ação 3: Avança o índice e o contador **
+        
+        // Move o índice para a próxima posição (circular).
+        int proximoIndice = (indiceAmostra + 1) % NUM_AMOSTRAS; 
+        
+        // Incrementa o contador de amostras coletadas (máximo NUM_AMOSTRAS).
+        if (amostrasColetadas < NUM_AMOSTRAS) {
+            amostrasColetadas++;
+        }
+
+        // --- 2. Lógica de Envio: ACIONADA QUANDO O BUFFER ESTÁ COMPLETO ---
+        // Se já coletamos 4 amostras E a próxima posição seria 0 (o que significa que esta foi a 4ª amostra).
+        if (amostrasColetadas == NUM_AMOSTRAS && proximoIndice == 0) {
+            // O envio será acionado exatamente após a 4ª, 8ª, 12ª, etc., coleta.
+
+            // 3. Cálculo da Média (média das últimas N leituras)
+            int tamanho_real = NUM_AMOSTRAS; // Agora sempre 4, após o buffer estar cheio.
+            
+            float mediaDistancia = calcular_media(distarray, tamanho_real); 
+            float mediaLux = calcular_media(lux_arr, tamanho_real);
+            long timestamp = get_current_timestamp(); // Pega o timestamp atual.
+            
+            Serial.println("\n--- ANÁLISE DE ENVIO (Média Móvel) ---");
+            Serial.printf("Amostras na Média: %d\n", tamanho_real);
+            Serial.printf("Média Distância: %.2f cm (Limiar: %.2f cm)\n", mediaDistancia, LIMIAR_DISTANCIA_CM); 
+            Serial.printf("Média Luminosidade: %.2f lx (Limiar: %.2f lx)\n", mediaLux, LIMIAR_LUX);
+
+            // 4. Lógica de Alerta Condicional
+            bool alertaProximidade = mediaDistancia < LIMIAR_DISTANCIA_CM; 
+            bool alertaLuminosidade = mediaLux < LIMIAR_LUX;
+            
+            // Mensagem no Serial Monitor para indicar se houve alerta
+            if (alertaProximidade || alertaLuminosidade) {
+                Serial.print("** ALERTA DETECTADO! Tipo(s): ");
+                if (alertaProximidade) Serial.print("[PROXIMIDADE] ");
+                if (alertaLuminosidade) Serial.print("[LUMINOSIDADE]");
+                Serial.println(" **");
+            } else {
+                Serial.println("Condição normal. Nenhum alerta disparado.");
+            }
+            
+            // 5. CHAMA A FUNÇÃO DE ENVIO DE DADOS
+            enviar_dados_sheets(mediaDistancia, mediaLux, timestamp, alertaProximidade, alertaLuminosidade); 
+
+            Serial.println("------------------------------------------\n");
+        }
+
+        // Atualiza o índice para o próximo ciclo
+        indiceAmostra = proximoIndice; 
     }
-
-    // 3. Envia os dados
-    enviar_dados_sheets(distance, lux);
     
-    // 4. Pausa antes da próxima leitura/envio
-    delay(30000); // Aguarda 30 segundos antes de executar o loop novamente.
+    // Pequeno delay para evitar que o loop rode rápido demais e trave o ESP32 (não é bloqueante)
+    delay(10); 
 }
