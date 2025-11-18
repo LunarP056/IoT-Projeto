@@ -1,323 +1,295 @@
 /*
- * PROJETO: Monitoramento de Ambiente com ESP32 (Luminosidade e Distância)
- * FUNÇÃO: Coletar dados de sensores e enviar via HTTP POST para uma planilha Google Sheets (Apps Script).
- * DEPENDÊNCIAS: Core ESP32, WiFiManager, BH1750.
+ * PROJETO: Logger IoT para ThingSpeak (Canal Único, 3 Fields)
+ * FUNÇÃO: Coletar dados de sensores (HC-SR04 e BH1750), fazer uma média de 5 leituras
+ * a cada 15 segundos, e enviar os resultados junto com o MAC Address para o ThingSpeak:
+ * Field 1: Média de Distância (cm)
+ * Field 2: Média de Luminosidade (Lux)
+ * Field 3: MAC Address do Dispositivo
  */
 
 // ====================================================================
 // INCLUSÃO DE BIBLIOTECAS
 // ====================================================================
 
-#include <WiFi.h>        // Biblioteca nativa para funcionalidades Wi-Fi do ESP32.
-#include <WiFiManager.h> // Gerenciador para configurar o Wi-Fi sem codificar SSID/Senha.
-#include <time.h>        // Biblioteca para sincronização de tempo (NTP) e timestamps.
-#include <Wire.h>        // Biblioteca para comunicação I2C (necessária para o sensor BH1750).
-#include <BH1750.h>      // Driver para o sensor de luminosidade BH1750.
-#include <HTTPClient.h>  // Biblioteca para fazer requisições HTTP (enviar dados para a web).
+#include <WiFi.h>          // Biblioteca principal para gerenciamento de Wi-Fi.
+#include <WiFiManager.h>   // Biblioteca de Provisionamento Simplificado (Portal Cativo).
+#include <time.h>          // Biblioteca para sincronização de tempo (NTP).
+#include <Wire.h>          // Biblioteca para comunicação I2C (usada pelo BH1750).
+#include <BH1750.h>        // Biblioteca para o sensor de luminosidade digital BH1750.
+#include <HTTPClient.h>    // Cliente HTTP para fazer requisições GET para o ThingSpeak.
+#include <Arduino.h>       // Inclui funções básicas do Arduino.
 
 // ====================================================================
-// CONFIGURAÇÕES GLOBAIS (EDITÁVEIS)
+// CONFIGURAÇÕES DO THINGSPEAK (PREENCHA AQUI!)
 // ====================================================================
 
-// URL do Google Apps Script para receber os dados via POST.
-const char* SHEETS_URL = "https://script.google.com/macros/s/AKfycbyd12345ABCDEFabcdef0123456789/exec"; 
+const char* THINGSPEAK_API_HOST = "http://api.thingspeak.com/update"; 
+const char* THINGSPEAK_CHANNEL_ID = "3166584"; 
+const char* THINGSPEAK_WRITE_API_KEY = "2RY2FMBN3TFXTYYM"; 
 
-// ID único para identificar este dispositivo na planilha.
-const char* DEVICE_ID = "PC_USER_01"; 
-
-// Configurações do NTP (Network Time Protocol) para sincronizar o relógio do ESP32.
-const char* ntpServer = "pool.ntp.org";      // Servidor NTP global.
-const long gmtOffset_sec = -10800;           // Offset de GMT em segundos (Ex: -3 horas para Brasília: -3 * 3600 = -10800).
-const int daylightOffset_sec = 0;            // Ajuste para Horário de Verão (0 se não usado).
+const int FIELD_DISTANCIA = 1;       
+const int FIELD_LUZ = 2;             
+const int FIELD_MAC_ADDRESS = 3;     
 
 // ====================================================================
-// VARIÁVEIS DE CÁLCULO E TEMPORIZAÇÃO (MILLIS)
+// CONFIGURAÇÕES GLOBAIS E VARIÁVEIS DE CONEXÃO
 // ====================================================================
 
-// Intervalo entre cada leitura de sensor (10 segundos = 10000 ms).
-const long LEITURA_INTERVALO_MS = 10000; 
-unsigned long ultimoTempoLeitura = 0; // Armazena o último momento que a leitura foi feita.
+// --- Configurações NTP (Network Time Protocol) ---
+const char* ntpServer = "pool.ntp.org"; 
+const long gmtOffset_sec = -10800;      
+const int daylightOffset_sec = 0;       
 
-// --- Configurações da Média Móvel ---
-// Baseado no intervalo de 10s, definimos 4 amostras.
-// O envio ocorrerá a cada 4 amostras (40 segundos).
-const int NUM_AMOSTRAS = 4; 
-int indiceAmostra = 0; // Índice atual da amostra no array (onde o próximo dado será armazenado).
-int amostrasColetadas = 0; // Contador de quantas amostras válidas foram coletadas (máximo NUM_AMOSTRAS)
+// --- Configurações de Hardware (Pinos GPIO) ---
+const int trigPin = 12; // Pino Trigger do sensor ultrassônico HC-SR04.
+const int echoPin = 14; // Pino Echo do sensor ultrassônico HC-SR04.
+const int I2C_SDA = 21; // Pino SDA (Dados) para comunicação I2C.
+const int I2C_SCL = 22; // Pino SCL (Clock) para comunicação I2C.
 
-// Arrays para armazenar as últimas N amostras para o cálculo da média.
-float distarray[NUM_AMOSTRAS]; // Array para distância
-float lux_arr[NUM_AMOSTRAS]; // Array para luminosidade
-
-// --- Limiares de Alerta ---
-const float LIMIAR_DISTANCIA_CM = 50.0; // Distância (muito próximo) 
-const float LIMIAR_LUX = 30.0;         // Luminosidade (muito escuro)
+// --- Filtros de Sanidade para o HC-SR04 ---
+const float MAX_DISTANCE_CM = 350.0;     // Distância máxima plausível para o HC-SR04
+const float MIN_VALID_DISTANCE_CM = 2.0; // Distância mínima (abaixo disso é ruído/suporte/Zona Cega)
 
 // ====================================================================
-// VARIÁVEIS DE HARDWARE E ESTADO
+// VARIÁVEIS DE CÁLCULO E TEMPORIZAÇÃO (Lógica de Média)
 // ====================================================================
 
-// Cria um objeto para o sensor BH1750.
-BH1750 lightmeter;
+const long LEITURA_INTERVALO_MS = 15000; 
+const int NUM_AMOSTRAS = 5;
+const long COLETA_INTERVALO_MS = LEITURA_INTERVALO_MS / NUM_AMOSTRAS; 
 
-// Pinos GPIO do ESP32 para o sensor ultrassônico HC-SR04.
-const int trigPin = 12; // Pino Trigger (OUTPUT) - Envia o pulso sonoro.
-const int echoPin = 14; // Pino Echo (INPUT) - Recebe o retorno do pulso sonoro.
+unsigned long ultimoTempoColeta = 0; 
+float somaDistancia = 0.0;          
+float somaLux = 0.0;                
+int contadorAmostras = 0;           
 
-// Flag para garantir que o sensor BH1750 seja inicializado apenas uma vez.
-bool bh1750_iniciado = false; 
+// ====================================================================
+// VARIÁVEIS DE IDENTIFICAÇÃO DO DISPOSITIVO
+// ====================================================================
 
-// Objeto cliente WiFi (usado internamente pela HTTPClient, mas bom declarar).
-WiFiClient espClient; 
+String deviceMacAddress = ""; 
+
+// ====================================================================
+// OBJETOS DE HARDWARE
+// ====================================================================
+
+BH1750 lightmeter; 
 
 // ====================================================================
 // FUNÇÃO: setup_wifi_manager()
 // ====================================================================
 
+/**
+ * @brief Gerencia a conexão Wi-Fi utilizando o WiFiManager.
+ */
 void setup_wifi_manager() {
-    WiFiManager wm; // Cria uma instância do WiFiManager.
-
+    WiFiManager wm; 
     Serial.println("Iniciando WiFiManager...");
-
-    // Tenta conectar automaticamente. Se falhar, cria o Access Point (AP) "ESP Setup".
     if (!wm.autoConnect("ESP Setup", "12345678")) {
         Serial.println("Falha na conexão Wi-Fi. Reiniciando em 3 segundos...");
         delay(3000);
-        ESP.restart(); // Reinicia o ESP32 se a conexão falhar.
-    } 
-
+        ESP.restart(); 
+    }
     Serial.println("WiFi Conectado!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-
-    // Configura e sincroniza o relógio interno do ESP32 via NTP.
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     Serial.println("Tempo sincronizado via NTP.");
 }
 
 // ====================================================================
-// FUNÇÃO: get_current_timestamp()
+// FUNÇÕES DE UTILIDADE E SENSORES
 // ====================================================================
 
-long get_current_timestamp() {
-    time_t now;      // Variável para o timestamp Unix.
-    struct tm timeinfo; // Estrutura para informações de data/hora.
-    
-    // Tenta obter a hora local sincronizada.
-    if (!getLocalTime(&timeinfo)) {
-        return 0; // Retorna 0 se falhar na obtenção do tempo.
-    }
-    
-    time(&now); // Converte o struct tm para timestamp.
-    return now;
-}
-
-// ====================================================================
-// FUNÇÃO: proximidade()
-// ====================================================================
-
+/**
+ * @brief Calcula a distância em centímetros usando o HC-SR04 (Ultrassônico) com filtro.
+ * @return float Distância calculada em centímetros (cm). Retorna -1.0 se inválida.
+ */
 float proximidade() {
-    // 1. Limpa o pino TRIGGER (garante LOW por 2µs).
+    // 1. Limpa o TrigPin (garante pulso baixo por 2µs)
     digitalWrite(trigPin, LOW);
     delayMicroseconds(2);
-    
-    // 2. Envia um pulso alto de 10µs no TRIGGER (dispara o som).
+    // 2. Envia um pulso alto (Trigger) por 10µs
     digitalWrite(trigPin, HIGH);
     delayMicroseconds(10);
+    // 3. Desliga o pulso
     digitalWrite(trigPin, LOW);
 
-    // 3. Mede a duração do pulso de retorno no pino ECHO (tempo que o som levou para ir e voltar).
-    unsigned long duration = pulseIn(echoPin, HIGH);
+    // 4. Mede a duração do pulso de retorno (Echo)
+    // Timeout de 30ms para evitar travamento em caso de erro ou longo alcance.
+    unsigned long duration = pulseIn(echoPin, HIGH, 30000); 
     
-    // 4. Calcula a distância: (duração * velocidade do som em cm/µs) / 2
-    // Velocidade do som (343 m/s) = 0.0343 cm/µs.
-    float distance = (duration * 0.0343) / 2;
-    
-    return distance; // Distância em centímetros.
+    // 5. Calcula a distância (d = t * v_som / 2)
+    float distance = (duration * 0.0343) / 2; 
+
+    // --- FILTRAGEM DE SANIDADE (Zona Cega e Limite Máximo) ---
+    if (distance > MAX_DISTANCE_CM || distance < MIN_VALID_DISTANCE_CM) {
+        // Se a duração for 0 (timeout) ou estiver fora da faixa plausível
+        return -1.0; // Valor de erro para descarte
+    }
+
+    return distance; 
 }
 
-// ====================================================================
-// FUNÇÃO: luminosidade()
-// ====================================================================
-
+/**
+ * @brief Lê o nível de luminosidade em Lux do BH1750.
+ * @return float Luminosidade em Lux. Retorna -2.0 em caso de erro na leitura.
+ */
 float luminosidade() {
-    // Inicializa o sensor APENAS na primeira vez que a função é chamada.
-    if (!bh1750_iniciado) {
-        // Tenta iniciar a comunicação I2C com o modo de alta resolução contínua.
-        if (lightmeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
-            Serial.println("BH1750 Pronto!");
-            bh1750_iniciado = true;
-        } else {
-            // Falha na inicialização do sensor.
-            Serial.println("ERRO: BH1750 não encontrado.");
-            return -3.00; // Valor de erro para ser ignorado no loop principal.
-        }
-    }
+    // A função retorna -1.0 internamente se a medição não estiver pronta.
+    float lux = lightmeter.readLightLevel(); 
     
-    // Retorna a leitura do nível de luz em Lux.
-    return lightmeter.readLightLevel();
+    if (lux < 0.0) {
+        // Se a leitura falhou ou está indisponível, retornamos um código de erro
+        // diferente para podermos distinguir do filtro de distância.
+        return -2.0; 
+    }
+    return lux; 
 }
 
 // ====================================================================
-// FUNÇÃO: enviar_dados_sheets()
+// FUNÇÃO: enviar_dados_thingspeak()
 // ====================================================================
 
-void enviar_dados_sheets(float distance_avg, float lux_avg, long timestamp, bool alertaProx, bool alertaLux) {
-    // Verifica a conexão Wi-Fi antes de tentar o envio.
+/**
+ * @brief Envia os dados de distância (média), luz (média) e MAC Address em uma ÚNICA requisição.
+ */
+void enviar_dados_thingspeak(float distance, float lux, const String& macAddress) {
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Wi-Fi não conectado. Pulando envio.");
-        return;
+        Serial.println("ERRO: Wi-Fi desconectado. Não foi possível enviar.");
+        return; 
     }
 
-    HTTPClient http;
-    http.begin(SHEETS_URL); // Inicia a conexão HTTP com o URL do Google Sheets.
-    http.addHeader("Content-Type", "application/json"); // Define o cabeçalho para JSON.
+    HTTPClient http; 
+    char urlBuffer[300]; 
 
-    char payload[350]; 
-    
-    char dist_str[10];
-    char lux_str[10];
-    char ts_str[15]; 
-    
-    // Converte floats para strings com 2 casas decimais.
-    dtostrf(distance_avg, 4, 2, dist_str); 
-    dtostrf(lux_avg, 4, 2, lux_str);
-    
-    // Converte o long timestamp para string.
-    snprintf(ts_str, sizeof(ts_str), "%ld", timestamp); 
+    // Cria a string da URL com todos os campos formatados.
+    snprintf(urlBuffer, sizeof(urlBuffer),
+              "%s?api_key=%s&field%d=%.2f&field%d=%.2f&field%d=%s",
+              THINGSPEAK_API_HOST,
+              THINGSPEAK_WRITE_API_KEY,
+              FIELD_DISTANCIA,
+              distance, 
+              FIELD_LUZ,
+              lux, 
+              FIELD_MAC_ADDRESS,
+              macAddress.c_str() 
+              );
 
-    // --- Montagem do JSON ---
-    snprintf(payload, sizeof(payload), 
-             "{\"id\":\"%s\",\"distance\":%s,\"lux\":%s,\"timestamp\":%s,\"alertaProx\":%s,\"alertaLux\":%s}", 
-             DEVICE_ID, 
-             dist_str, 
-             lux_str,
-             ts_str,
-             alertaProx ? "true" : "false", 
-             alertaLux ? "true" : "false"); 
-    
-    Serial.print("Enviando JSON de Alerta: ");
-    Serial.println(payload);
+    Serial.printf("Enviando Média Dist (%.2f cm), Média Lux (%.2f lx) e MAC (%s)...\n", 
+                  distance, lux, macAddress.c_str());
 
-    int httpResponseCode = http.POST(payload);
+    http.begin(urlBuffer); 
+
+    int httpResponseCode = http.GET();
 
     if (httpResponseCode > 0) {
-        // Código de resposta HTTP positivo, o ESP32 enviou o pacote.
-        Serial.printf("Dados enviados. Código HTTP: %d\n", httpResponseCode);
+        String response = http.getString();
+        Serial.printf("Envio bem-sucedido. Código HTTP: %d (Entry ID: %s)\n", httpResponseCode, response.c_str());
     } else {
-        // Código de resposta HTTP negativo (ex: -11 é falha na conexão, 404 é URL não encontrada).
-        Serial.printf("Falha ao enviar dados. Erro HTTP: %d (Verifique a SHEETS_URL e o status do Wi-Fi)\n", httpResponseCode);
+        Serial.printf("Falha ao enviar dados. Erro HTTP: %d\n", httpResponseCode);
+        Serial.printf("Mensagem de Erro: %s\n", http.errorToString(httpResponseCode).c_str());
     }
-    
-    http.end(); // Fecha a conexão HTTP.
+
+    http.end(); 
 }
 
-// ====================================================================
-// Calcula a média de um array de floats.
 
-float calcular_media(float arr[], int tamanho) {
-    float soma = 0.0;
-    
-    for (int i = 0; i < tamanho; i++) {
-        soma += arr[i];
-    }
-    // Garante que não dividimos por zero e retorna a média.
-    return (tamanho > 0) ? (soma / tamanho) : 0.0;
-}
 // ====================================================================
-// FUNÇÃO: setup()
+// FUNÇÃO: setup() - Configuração Inicial
 // ====================================================================
 
 void setup() {
-    Serial.begin(9600); // Inicia a comunicação serial para debug (Monitor Serial).
+    Serial.begin(9600); 
+    Serial.println("\n--- Inicializando ESP32 (Logger ThingSpeak com Média de Amostras) ---");
+    Serial.setDebugOutput(true); 
+
+    // 1. Configuração dos pinos do sensor ultrassônico.
+    pinMode(trigPin, OUTPUT); 
+    pinMode(echoPin, INPUT);  
+
+    // 2. Configura a conexão Wi-Fi.
+    setup_wifi_manager();
     
-    // Configuração dos pinos do sensor ultrassônico.
-    pinMode(trigPin, OUTPUT);
-    pinMode(echoPin, INPUT); 
+    // 2.1 Captura o MAC Address para identificação
+    deviceMacAddress = WiFi.macAddress();
+    Serial.printf("MAC Address do Dispositivo: %s\n", deviceMacAddress.c_str());
 
-    // Configura o Wi-Fi e sincroniza o tempo via NTP.
-    setup_wifi_manager(); 
-
-    // Inicializa a comunicação I2C.
-    // Padrão do ESP32 DevKit: SDA=21, SCL=22. Ajuste se usar pinos diferentes.
-    Wire.begin(21, 22); 
-    delay(200); // Pequena pausa para estabilização do I2C.
+    // 3. Inicializa a comunicação I2C e o sensor BH1750.
+    Wire.begin(I2C_SDA, I2C_SCL); 
+    delay(200); 
+    
+    if (lightmeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+        Serial.println("BH1750 Pronto!");
+    } else {
+        Serial.println("ERRO: BH1750 não encontrado! A leitura de Lux será inválida.");
+    }
 }
 
 // ====================================================================
-// FUNÇÃO: loop()
+// FUNÇÃO: loop() - Loop Principal de Execução
 // ====================================================================
 
 void loop() {
+    // Checa a conexão Wi-Fi periodicamente e tenta reconectar.
+    if (WiFi.status() != WL_CONNECTED) {
+        if(millis() % 5000 < 50){
+            WiFi.reconnect();
+        }
+        delay(100);
+        return; 
+    }
+
     unsigned long tempoAtual = millis();
 
-    // --- 1. Lógica de Coleta de Dados (a cada 10 segundos) ---
-    if (tempoAtual - ultimoTempoLeitura >= LEITURA_INTERVALO_MS) {
-        ultimoTempoLeitura = tempoAtual;
+    // ----------------------------------------------------
+    // LÓGICA DE COLETA (COLETA_INTERVALO_MS = 3 SEGUNDOS)
+    // ----------------------------------------------------
+    if (tempoAtual - ultimoTempoColeta >= COLETA_INTERVALO_MS) {
+        ultimoTempoColeta = tempoAtual; 
 
-        // ** Ação 1: Coleta dos dados dos sensores **
         float distancia = proximidade();
-        float lux = luminosidade(); 
+        float lux = luminosidade();
         
-        // ** Ação 2: Armazenamento circular dos dados **
-        
-        // Armazena a leitura atual no índice atual dos arrays.
-        distarray[indiceAmostra] = distancia; 
-        lux_arr[indiceAmostra] = lux;
-        
-        Serial.printf("\n[COLETA #%d] Dist: %.2f cm | Lux: %.2f lx\n", indiceAmostra, distancia, lux);
+        // Verifica se ambas as leituras estão dentro da faixa de plausibilidade.
+        bool leituraValida = (distancia != -1.0) && (lux != -2.0);
 
-        // ** Ação 3: Avança o índice e o contador **
-        
-        // Move o índice para a próxima posição (circular).
-        int proximoIndice = (indiceAmostra + 1) % NUM_AMOSTRAS; 
-        
-        // Incrementa o contador de amostras coletadas (máximo NUM_AMOSTRAS).
-        if (amostrasColetadas < NUM_AMOSTRAS) {
-            amostrasColetadas++;
-        }
-
-        // --- 2. Lógica de Envio: ACIONADA QUANDO O BUFFER ESTÁ COMPLETO ---
-        // Se já coletamos 4 amostras E a próxima posição seria 0 (o que significa que esta foi a 4ª amostra).
-        if (amostrasColetadas == NUM_AMOSTRAS && proximoIndice == 0) {
-            // O envio será acionado exatamente após a 4ª, 8ª, 12ª, etc., coleta.
-
-            // 3. Cálculo da Média (média das últimas N leituras)
-            int tamanho_real = NUM_AMOSTRAS; // Agora sempre 4, após o buffer estar cheio.
-            
-            float mediaDistancia = calcular_media(distarray, tamanho_real); 
-            float mediaLux = calcular_media(lux_arr, tamanho_real);
-            long timestamp = get_current_timestamp(); // Pega o timestamp atual.
-            
-            Serial.println("\n--- ANÁLISE DE ENVIO (Média Móvel) ---");
-            Serial.printf("Amostras na Média: %d\n", tamanho_real);
-            Serial.printf("Média Distância: %.2f cm (Limiar: %.2f cm)\n", mediaDistancia, LIMIAR_DISTANCIA_CM); 
-            Serial.printf("Média Luminosidade: %.2f lx (Limiar: %.2f lx)\n", mediaLux, LIMIAR_LUX);
-
-            // 4. Lógica de Alerta Condicional
-            bool alertaProximidade = mediaDistancia < LIMIAR_DISTANCIA_CM; 
-            bool alertaLuminosidade = mediaLux < LIMIAR_LUX;
-            
-            // Mensagem no Serial Monitor para indicar se houve alerta
-            if (alertaProximidade || alertaLuminosidade) {
-                Serial.print("** ALERTA DETECTADO! Tipo(s): ");
-                if (alertaProximidade) Serial.print("[PROXIMIDADE] ");
-                if (alertaLuminosidade) Serial.print("[LUMINOSIDADE]");
-                Serial.println(" **");
-            } else {
-                Serial.println("Condição normal. Nenhum alerta disparado.");
+        if (leituraValida) {
+            // Se ambos os sensores retornaram valores plausíveis, acumulamos.
+            somaDistancia += distancia;
+            somaLux += lux;
+            contadorAmostras++;
+            Serial.printf("[Coleta %d/%d] Válida. Distância: %.2f cm | Luminosidade: %.2f lx\n", 
+                          contadorAmostras, NUM_AMOSTRAS, distancia, lux);
+        } else {
+            // Log detalhado de por que a amostra foi descartada.
+            if (distancia == -1.0) {
+                Serial.println("❌ Amostra descartada: Distância fora da faixa válida (2cm a 350cm).");
             }
-            
-            // 5. CHAMA A FUNÇÃO DE ENVIO DE DADOS
-            enviar_dados_sheets(mediaDistancia, mediaLux, timestamp, alertaProximidade, alertaLuminosidade); 
-
-            Serial.println("------------------------------------------\n");
+            if (lux == -2.0) {
+                Serial.println("❌ Amostra descartada: Falha na leitura BH1750 (Sensor não pronto ou erro I2C).");
+            }
         }
-
-        // Atualiza o índice para o próximo ciclo
-        indiceAmostra = proximoIndice; 
     }
     
-    // Pequeno delay para evitar que o loop rode rápido demais e trave o ESP32 (não é bloqueante)
-    delay(10); 
+    // ----------------------------------------------------
+    // LÓGICA DE ENVIO (QUANDO NUM_AMOSTRAS = 5 ESTIVEREM PRONTAS)
+    // ----------------------------------------------------
+    if (contadorAmostras >= NUM_AMOSTRAS) {
+        
+        float mediaDistancia = somaDistancia / NUM_AMOSTRAS;
+        float mediaLux = somaLux / NUM_AMOSTRAS;
+
+        Serial.printf("\n--- ENVIO THINGSPEAK (Média de %d leituras, total 15s) ---\n", NUM_AMOSTRAS);
+        Serial.printf("Média de Envio: Distância=%.2f cm | Luz=%.2f lx\n", mediaDistancia, mediaLux);
+
+        enviar_dados_thingspeak(mediaDistancia, mediaLux, deviceMacAddress); 
+
+        // Reinicia os acumuladores e o contador para o próximo ciclo de 15s
+        somaDistancia = 0.0;
+        somaLux = 0.0;
+        contadorAmostras = 0;
+
+        Serial.println("------------------------------------------\n");
+    }
+
+    delay(10);
 }
